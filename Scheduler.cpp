@@ -6,9 +6,16 @@
 //
 
 #include "Scheduler.hpp"
+#include <climits>
 
 static bool migrating = false;
 static unsigned active_machines = 16;
+
+static Priority_t PriorityFromSLA(SLAType_t s) {
+    if(s == SLA0) return HIGH_PRIORITY;
+    if(s == SLA1) return MID_PRIORITY;
+    return LOW_PRIORITY;
+}
 
 void Scheduler::Init() {
     // Find the parameters of the clusters
@@ -18,32 +25,30 @@ void Scheduler::Init() {
     //      Get the memory of the machine
     //      Get the number of CPUs
     //      Get if there is a GPU or not
-    // 
-    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
-    SimOutput("Scheduler::Init(): Initializing scheduler", 1);
-    for(unsigned i = 0; i < active_machines; i++)
-        vms.push_back(VM_Create(LINUX, X86));
+    //
+    unsigned total = Machine_GetTotal();
+    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total), 3);
+    SimOutput("Scheduler::Init(): Initializing scheduler (Greedy)", 1);
+
+    active_machines = total;
+    vms.clear();
+    machines.clear();
+    vms.reserve(active_machines);
+    machines.reserve(active_machines);
+
     for(unsigned i = 0; i < active_machines; i++) {
-        machines.push_back(MachineId_t(i));
-    }    
-    for(unsigned i = 0; i < active_machines; i++) {
-        VM_Attach(vms[i], machines[i]);
+        MachineId_t mid = MachineId_t(i);
+        MachineInfo_t mi = Machine_GetInfo(mid);
+        if(mi.s_state != S0) Machine_SetState(mid, S0);
+        machines.push_back(mid);
     }
-
-    bool dynamic = false;
-    if(dynamic)
-        for(unsigned i = 0; i<4 ; i++)
-            for(unsigned j = 0; j < 8; j++)
-                Machine_SetCorePerformance(MachineId_t(0), j, P3);
-    // Turn off the ARM machines
-    for(unsigned i = 24; i < Machine_GetTotal(); i++)
-        Machine_SetState(MachineId_t(i), S5);
-
-    SimOutput("Scheduler::Init(): VM ids are " + to_string(vms[0]) + " ahd " + to_string(vms[1]), 3);
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
     // Update your data structure. The VM now can receive new tasks
+    (void)time;
+    (void)vm_id;
+    migrating = false;
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
@@ -64,13 +69,64 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Turn on a machine, migrate an existing VM from a loaded machine....
     //
     // Other possibilities as desired
-    Priority_t priority = (task_id == 0 || task_id == 64)? HIGH_PRIORITY : MID_PRIORITY;
-    if(migrating) {
-        VM_AddTask(vms[0], task_id, priority);
+    (void)now;
+
+    CPUType_t need_cpu = RequiredCPUType(task_id);
+    VMType_t need_vm = RequiredVMType(task_id);
+    bool need_gpu = IsTaskGPUCapable(task_id);
+    unsigned need_mem = GetTaskMemory(task_id);
+    Priority_t priority = PriorityFromSLA(RequiredSLA(task_id));
+
+    int best_i = -1;
+    double best_slack = -1.0;
+
+    for(unsigned i = 0; i < machines.size(); i++) {
+        MachineInfo_t mi = Machine_GetInfo(machines[i]);
+
+        if(mi.s_state != S0) continue;
+        // testing allowing different cpu types for now
+        //if(mi.cpu != need_cpu) continue; 
+        if(mi.memory_used + need_mem > mi.memory_size) continue;
+
+        double u = 0.0;
+        if(mi.num_cpus > 0) u = (double)mi.active_tasks / (double)mi.num_cpus;
+        double v = (double)(mi.memory_used + need_mem) / (double)mi.memory_size;
+        double slack = 1.0 - (u + v);
+        if(need_gpu && mi.gpus) slack += 0.05;
+        if(slack > best_slack) {
+            best_slack = slack;
+            best_i = (int)i;
+        }
     }
-    else {
-        VM_AddTask(vms[task_id % active_machines], task_id, priority);
-    }// Skeleton code, you need to change it according to your algorithm
+
+    if(best_i >= 0) {
+        MachineId_t host = machines[best_i];
+
+        VMId_t chosen_vm = 0;
+        bool found = false;
+        for(unsigned i = 0; i < vms.size(); i++) {
+            VMInfo_t vi = VM_GetInfo(vms[i]);
+            if(vi.machine_id == host && vi.vm_type == need_vm && vi.cpu == need_cpu) {
+                chosen_vm = vms[i];
+                found = true;
+                break;
+            }
+        }
+
+        if(!found) {
+            MachineInfo_t mh = Machine_GetInfo(host);
+            VMId_t vm = VM_Create(need_vm, mh.cpu);
+            VM_Attach(vm, host);
+            vms.push_back(vm);
+            chosen_vm = vm;
+        }
+
+        VM_AddTask(chosen_vm, task_id, priority);
+        SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " assigned to VM " + to_string(chosen_vm) + " on machine " + to_string(host), 3);
+        return;
+    }
+
+    SimOutput("Scheduler::NewTask(): No compatible host found for task " + to_string(task_id) + " - leaving unallocated", 0);
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
@@ -78,6 +134,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
+    (void)now;
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -134,12 +191,6 @@ void SchedulerCheck(Time_t time) {
     // This function is called periodically by the simulator, no specific event
     SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 4);
     Scheduler.PeriodicCheck(time);
-    static unsigned counts = 0;
-    counts++;
-    if(counts == 10) {
-        migrating = true;
-        VM_Migrate(1, 9);
-    }
 }
 
 void SimulationComplete(Time_t time) {
@@ -151,15 +202,17 @@ void SimulationComplete(Time_t time) {
     cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
     cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
     SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
-    
     Scheduler.Shutdown(time);
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
-    
+    // If a task is late, boost its priority
+    (void)time;
+    (void)task_id;
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
     // Called in response to an earlier request to change the state of a machine
+    (void)time;
+    (void)machine_id;
 }
-
