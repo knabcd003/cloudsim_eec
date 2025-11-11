@@ -11,7 +11,7 @@
 static bool migrating = false;
 static unsigned active_machines = 16;
 
-// Helper: convert SLA type to task priority
+// convert SLA type to task priority
 static Priority_t PriorityFromSLA(SLAType_t s) {
     switch (s) {
         case SLA0: return HIGH_PRIORITY;
@@ -20,7 +20,7 @@ static Priority_t PriorityFromSLA(SLAType_t s) {
     }
 }
 
-// Helper: choose a default VM type for a machine CPU
+// choose a default VM type for a machine CPU
 static VMType_t DefaultVMTypeForCPU(CPUType_t cpu) {
     // POWER tasks in inputs use AIX, others use LINUX
     if (cpu == POWER)  return AIX;
@@ -38,9 +38,9 @@ void Scheduler::Init() {
     //
     unsigned total = Machine_GetTotal();
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total), 3);
-    SimOutput("Scheduler::Init(): Initializing scheduler (Load Balancing)", 1);
+    SimOutput("Scheduler::Init(): Initializing scheduler (SLA-Partitioned)", 1);
 
-    // For pure load balancing, we will consider all machines.
+    // Use all machines
     active_machines = total;
 
     vms.reserve(active_machines);
@@ -53,9 +53,9 @@ void Scheduler::Init() {
         MachineId_t mid = MachineId_t(i);
         MachineInfo_t mi = Machine_GetInfo(mid);
 
-        // Ensure machine is on and ready
-        if (mi.s_state != S0) {
+        // Make sure machine is on at start
             Machine_SetState(mid, S0);
+            mi = Machine_GetInfo(mid);
         }
 
         VMType_t vm_type = DefaultVMTypeForCPU(mi.cpu);
@@ -77,10 +77,26 @@ void Scheduler::Init() {
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    // Update your data structure. The VM now can receive new tasks
+    // The VM now can receive new tasks
     (void)time;
     (void)vm_id;
     migrating = false;
+}
+
+static bool CanHost(const VMInfo_t &vminfo,
+                    const MachineInfo_t &mi,
+                    CPUType_t need_cpu,
+                    VMType_t need_vm,
+                    bool need_gpu,
+                    unsigned need_mem)
+{
+    if (mi.s_state != S0)                return false;
+    if (vminfo.cpu != need_cpu)          return false;
+    if (vminfo.vm_type != need_vm)       return false;
+    if (need_gpu && !mi.gpus)            return false;
+    if (mi.memory_used + need_mem > mi.memory_size)
+        return false;
+    return true;
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
@@ -94,58 +110,81 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // or create a new one if necessary
     (void)now;
 
-    CPUType_t need_cpu    = RequiredCPUType(task_id);
-    VMType_t  need_vm     = RequiredVMType(task_id);
-    bool      need_gpu    = IsTaskGPUCapable(task_id);
-    unsigned  need_mem    = GetTaskMemory(task_id);
-    Priority_t priority   = PriorityFromSLA(RequiredSLA(task_id));
+    CPUType_t  need_cpu   = RequiredCPUType(task_id);
+    VMType_t   need_vm    = RequiredVMType(task_id);
+    bool       need_gpu   = IsTaskGPUCapable(task_id);
+    unsigned   need_mem   = GetTaskMemory(task_id);
+    SLAType_t  sla        = RequiredSLA(task_id);
+    Priority_t priority   = PriorityFromSLA(sla);
 
-    int best_idx = -1;
-    unsigned best_load = UINT_MAX;
+    // Static partition:
+    // Use the first half of machines as a "high priority" pool,
+    // and the second half as a "best effort" pool.
+    unsigned total = vms.size();
+    unsigned high_end = total / 2;
+    unsigned low_begin = high_end;
 
-    // Load balancing:
-    // Among all VMs, pick the least-loaded compatible machine
-    for (unsigned i = 0; i < vms.size(); ++i) {
-        VMInfo_t vminfo = VM_GetInfo(vms[i]);
-        MachineInfo_t mi = Machine_GetInfo(vminfo.machine_id);
+    int chosen = -1;
 
-        // Machine must be on
-        if (mi.s_state != S0)
-            continue;
+    if (sla == SLA0 || sla == SLA1) {
+        // High-SLA tasks:
+        //   1) Try FIRST-FIT in the high-priority pool [0, high_end)
+        //   2) If none, fallback to FIRST-FIT over all machines
+        for (unsigned i = 0; i < high_end; ++i) {
+            VMInfo_t      vminfo = VM_GetInfo(vms[i]);
+            MachineInfo_t mi     = Machine_GetInfo(vminfo.machine_id);
+            if (CanHost(vminfo, mi, need_cpu, need_vm, need_gpu, need_mem)) {
+                chosen = static_cast<int>(i);
+                break;
+            }
+        }
 
-        // CPU type must match
-        if (vminfo.cpu != need_cpu)
-            continue;
+        if (chosen < 0) {
+            for (unsigned i = 0; i < total; ++i) {
+                VMInfo_t      vminfo = VM_GetInfo(vms[i]);
+                MachineInfo_t mi     = Machine_GetInfo(vminfo.machine_id);
+                if (CanHost(vminfo, mi, need_cpu, need_vm, need_gpu, need_mem)) {
+                    chosen = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+    } else {
+        // Low-SLA tasks (SLA2, SLA3):
+        //   1) Try FIRST-FIT in the best-effort pool [low_begin, total)
+        //   2) If none, fallback to FIRST-FIT over all machines
+        // best-effort pool
+        for (unsigned i = low_begin; i < total; ++i) {
+            VMInfo_t      vminfo = VM_GetInfo(vms[i]);
+            MachineInfo_t mi     = Machine_GetInfo(vminfo.machine_id);
+            if (CanHost(vminfo, mi, need_cpu, need_vm, need_gpu, need_mem)) {
+                chosen = static_cast<int>(i);
+                break;
+            }
+        }
 
-        // VM type must match required VM type
-        if (vminfo.vm_type != need_vm)
-            continue;
-
-        // If task needs GPU, machine must have GPU
-        if (need_gpu && !mi.gpus)
-            continue;
-
-        // Check memory capacity
-        if (mi.memory_used + need_mem > mi.memory_size)
-            continue;
-
-        // Use active_tasks for load balancing
-        if (mi.active_tasks < best_load) {
-            best_load = mi.active_tasks;
-            best_idx = static_cast<int>(i);
+        if (chosen < 0) {
+            for (unsigned i = 0; i < total; ++i) {
+                VMInfo_t      vminfo = VM_GetInfo(vms[i]);
+                MachineInfo_t mi     = Machine_GetInfo(vminfo.machine_id);
+                if (CanHost(vminfo, mi, need_cpu, need_vm, need_gpu, need_mem)) {
+                    chosen = static_cast<int>(i);
+                    break;
+                }
+            }
         }
     }
 
-    if (best_idx >= 0) {
-        VM_AddTask(vms[best_idx], task_id, priority);
+    if (chosen >= 0) {
+        VM_AddTask(vms[chosen], task_id, priority);
         SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) +
-                  " assigned to VM " + to_string(vms[best_idx]) +
-                  " on machine " + to_string(machines[best_idx]), 4);
+                  " assigned to VM " + to_string(vms[chosen]) +
+                  " on machine " + to_string(machines[chosen]), 4);
         return;
     }
 
     // No compatible host found:
-    // For this project phase, treat this as an SLA violation (unallocated),
+    // Treat as an SLA violation (unallocated),
     // rather than forcing an incompatible placement that crashes.
     SimOutput("Scheduler::NewTask(): No compatible host found for task " +
               to_string(task_id) + " - leaving unallocated", 0);
@@ -158,7 +197,10 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
     (void)now;
 
-    // For the basic load balancing algorithm, we do not do periodic migrations or power changes.
+    // No dynamic power or migrations here.
+    // Energy-related behavior is via static partitioning:
+    // low-SLA tasks are steered to a subset of machines,
+    // leaving others freer for high-SLA workloads.
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -180,28 +222,28 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) +
               " is complete at " + to_string(now), 4);
 
-    // No dynamic power or migration behavior for the plain load balancer.
+    // All decisions are made in NewTask(); no extra logic here.
 }
 
 // Public interface below
 
-static Scheduler Scheduler;
+static Scheduler SchedulerInstance;
 
 void InitScheduler() {
     SimOutput("InitScheduler(): Initializing scheduler", 4);
-    Scheduler.Init();
+    SchedulerInstance.Init();
 }
 
 void HandleNewTask(Time_t time, TaskId_t task_id) {
     SimOutput("HandleNewTask(): Received new task " + to_string(task_id) +
               " at time " + to_string(time), 4);
-    Scheduler.NewTask(time, task_id);
+    SchedulerInstance.NewTask(time, task_id);
 }
 
 void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
     SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) +
               " completed at time " + to_string(time), 4);
-    Scheduler.TaskComplete(time, task_id);
+    SchedulerInstance.TaskComplete(time, task_id);
 }
 
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
@@ -214,7 +256,7 @@ void MigrationDone(Time_t time, VMId_t vm_id) {
     // The function is called on to alert you that migration is complete
     SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) +
               " was completed at time " + to_string(time), 4);
-    Scheduler.MigrationComplete(time, vm_id);
+    SchedulerInstance.MigrationComplete(time, vm_id);
     migrating = false;
 }
 
@@ -222,7 +264,7 @@ void SchedulerCheck(Time_t time) {
     // This function is called periodically by the simulator, no specific event
     SimOutput("SchedulerCheck(): SchedulerCheck() called at " +
               to_string(time), 4);
-    Scheduler.PeriodicCheck(time);
+    SchedulerInstance.PeriodicCheck(time);
 }
 
 void SimulationComplete(Time_t time) {
@@ -236,7 +278,7 @@ void SimulationComplete(Time_t time) {
     SimOutput("SimulationComplete(): Simulation finished at time " +
               to_string(time), 4);
 
-    Scheduler.Shutdown(time);
+    SchedulerInstance.Shutdown(time);
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
