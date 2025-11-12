@@ -7,20 +7,21 @@
 
 #include "Scheduler.hpp"
 #include <climits>
+#include <cmath>
 
 static bool migrating = false;
 static unsigned active_machines = 16;
 
 static Priority_t PriorityFromSLA(SLAType_t s) {
-    if(s == SLA0) return HIGH_PRIORITY;
-    if(s == SLA1) return MID_PRIORITY;
+    if (s == SLA0) return HIGH_PRIORITY;
+    if (s == SLA1) return MID_PRIORITY;
     return LOW_PRIORITY;
 }
 
 void Scheduler::Init() {
     unsigned total = Machine_GetTotal();
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total), 3);
-    SimOutput("Scheduler::Init(): Initializing scheduler (Greedy)", 1);
+    SimOutput("Scheduler::Init(): Initializing scheduler (pMapper)", 1);
 
     active_machines = total;
     vms.clear();
@@ -28,11 +29,15 @@ void Scheduler::Init() {
     vms.reserve(active_machines);
     machines.reserve(active_machines);
 
-    for(unsigned i = 0; i < active_machines; i++) {
+    for (unsigned i = 0; i < active_machines; i++) {
         MachineId_t mid = MachineId_t(i);
         MachineInfo_t mi = Machine_GetInfo(mid);
-        if(mi.s_state != S0) Machine_SetState(mid, S0);
+        if (mi.s_state != S0) Machine_SetState(mid, S0);
         machines.push_back(mid);
+        SimOutput("Init machine " + to_string(i) +
+                  " cpu=" + to_string(mi.cpu) +
+                  " mem=" + to_string(mi.memory_size) +
+                  " gpu=" + string(mi.gpus ? "true" : "false"), 3);
     }
 }
 
@@ -45,61 +50,83 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     (void)now;
 
-    CPUType_t need_cpu = RequiredCPUType(task_id);
-    VMType_t  need_vm  = RequiredVMType(task_id);
-    bool      need_gpu = IsTaskGPUCapable(task_id);
-    unsigned  need_mem = GetTaskMemory(task_id);
+    CPUType_t  need_cpu = RequiredCPUType(task_id);
+    VMType_t   need_vm  = RequiredVMType(task_id);
+    bool       need_gpu = IsTaskGPUCapable(task_id);
+    unsigned   need_mem = GetTaskMemory(task_id);
     Priority_t priority = PriorityFromSLA(RequiredSLA(task_id));
 
     int best_i = -1;
-    double best_slack = -1.0;
+    double best_score = -1000000.0;
 
-    // finding the best machine that matches the task requirements
-    for(unsigned i = 0; i < machines.size(); i++) {
+    // Iterate through all available machines
+    for (unsigned i = 0; i < machines.size(); i++) {
         MachineInfo_t mi = Machine_GetInfo(machines[i]);
-        if(mi.s_state != S0) continue;
-        if(mi.cpu != need_cpu) continue; 
-        if(mi.memory_used + need_mem > mi.memory_size) continue;
+        if (mi.s_state != S0) continue;
+        if (mi.cpu != need_cpu) continue; 
+        if (need_gpu && !mi.gpus) continue;
+        if (mi.memory_used + need_mem > mi.memory_size) continue;
 
-        // calculating slack
-        double u = 0.0;
-        if(mi.num_cpus > 0) {
-            u = (double)mi.active_tasks / (double)mi.num_cpus;
-            if(u > 1.0) u = 1.0;
+        // calculating energy utilization
+        double cpu_util;
+        if (mi.num_cpus > 0) {
+            cpu_util = (double)mi.active_tasks / (double)mi.num_cpus;
+            if (cpu_util > 1.0) cpu_util = 1.0;
+        } else {
+            cpu_util = 0.0;
         }
 
-        double v = (double)(mi.memory_used + need_mem) / (double)mi.memory_size;
-        double slack = 1.0 - (u + v);
+        // calculating memory utilization
+        double mem_util = (double)(mi.memory_used + need_mem) / (double)mi.memory_size;
 
-        // essentially a preference for GPU machines
-        if(need_gpu && mi.gpus) slack += 0.05;
+        double efficiency = 1.0 - (0.5 * cpu_util + 0.5 * mem_util);
 
-        if(slack > best_slack) {
-            best_slack = slack;
+        // slightly prefer machines with a matching VM
+        for (auto &vm_id : vms) {
+            VMInfo_t vi = VM_GetInfo(vm_id);
+            if (vi.machine_id == machines[i] && vi.vm_type == need_vm && vi.cpu == need_cpu)
+                efficiency += 0.1;
+        }
+
+        // bonus for GPU-capable host if task needs GPU
+        if (need_gpu && mi.gpus) efficiency += 0.1;
+
+        // keeping track of the best machine
+        if (efficiency > best_score) {
+            best_score = efficiency;
             best_i = (int)i;
         }
     }
 
-    if(best_i >= 0) {
+    // assign task to the best machine found
+    if (best_i >= 0) {
         MachineId_t host = machines[best_i];
+        MachineInfo_t mi = Machine_GetInfo(host);
+        if (mi.cpu != need_cpu) {
+            SimOutput("Scheduler::NewTask(): Skipping incompatible CPU for task " + to_string(task_id), 0);
+            return;
+        }
 
         VMId_t chosen_vm = 0;
         bool found = false;
 
-        // reusing an existing VM if possible
-        for(unsigned i = 0; i < vms.size(); i++) {
+        // reuse VM if available
+        for (unsigned i = 0; i < vms.size(); i++) {
             VMInfo_t vi = VM_GetInfo(vms[i]);
-            if(vi.machine_id == host && vi.vm_type == need_vm && vi.cpu == need_cpu) {
+            if (vi.machine_id == host && vi.vm_type == need_vm && vi.cpu == need_cpu) {
                 chosen_vm = vms[i];
                 found = true;
                 break;
             }
         }
 
-        // creating a new VM if needed
-        if(!found) {
-            MachineInfo_t mi = Machine_GetInfo(host);
-            VMId_t vm = VM_Create(need_vm, mi.cpu); 
+        // create a new VM if none found
+        if (!found) {
+            VMId_t vm = VM_Create(need_vm, mi.cpu);
+            if (vm == (VMId_t)-1) {
+                SimOutput("Scheduler::NewTask(): VM_Create() failed for task " + to_string(task_id), 0);
+                return;
+            }
             VM_Attach(vm, host);
             vms.push_back(vm);
             chosen_vm = vm;
@@ -121,7 +148,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
 }
 
 void Scheduler::Shutdown(Time_t time) {
-    for(auto & vm: vms) {
+    for (auto &vm : vms) {
         VM_Shutdown(vm);
     }
     SimOutput("SimulationComplete(): Finished!", 4);
@@ -176,7 +203,7 @@ void SimulationComplete(Time_t time) {
     cout << "SLA1: " << GetSLAReport(SLA1) << "%" << endl;
     cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;
     cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
-    cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
+    cout << "Simulation run finished in " << double(time) / 1000000 << " seconds" << endl;
     SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
     Scheduler.Shutdown(time);
 }
